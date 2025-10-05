@@ -1,0 +1,6 @@
+name: chatgroup
+display_name: 讨论组工作流
+version: 0.1.0
+author: codex
+desc: 上下文裁剪与语义向量持久化存储，支持#讨论组 HTML 渲染查看聚类话题。
+repo: ""

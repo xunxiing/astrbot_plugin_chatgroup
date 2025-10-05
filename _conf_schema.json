@@ -1,0 +1,55 @@
+{
+  "llm": {
+    "description": "LLM 提供商选择（通过 AstrBot Provider 统一管理）",
+    "type": "object",
+    "items": {
+      "provider_id": {
+        "description": "LLM Provider 的 ID（在 AstrBot 配置中定义的 provider.id）",
+        "type": "string",
+        "default": ""
+      },
+      "model": {
+        "description": "使用的模型名（可覆盖 Provider 默认模型）",
+        "type": "string",
+        "default": ""
+      }
+    }
+  },
+  "embedding": {
+    "description": "Embedding 提供商选择（通过 AstrBot Provider 统一管理）",
+    "type": "object",
+    "items": {
+      "provider_id": {
+        "description": "Embedding Provider 的 ID（在 AstrBot 配置中定义的 provider.id）",
+        "type": "string",
+        "default": ""
+      },
+      "model": {
+        "description": "使用的向量模型名（可覆盖 Provider 默认模型）",
+        "type": "string",
+        "default": ""
+      }
+    }
+  },
+  "limits": {
+    "description": "限额与上下文裁剪",
+    "type": "object",
+    "items": {
+      "per_chat_cap": {
+        "description": "每个会话最多保留的消息条数",
+        "type": "int",
+        "default": 400
+      },
+      "trim_max_chars": {
+        "description": "上下文最大字符数",
+        "type": "int",
+        "default": 6000
+      },
+      "trim_max_msgs": {
+        "description": "上下文最多保留的消息数",
+        "type": "int",
+        "default": 30
+      }
+    }
+  }
+}
