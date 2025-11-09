@@ -100,8 +100,11 @@ class ChatGroupPlugin(Star):
         except Exception:
             pass
 
-        # recording configs
-        self._record_enabled = str(os.getenv("CHATGROUP_RECORD", "1")).strip() not in {"0", "false", "False"}
+        # 初始化录制开关
+        val = str(os.getenv("CHATGROUP_RECORD_ENABLED", "1")).strip().lower()
+        self._record_enabled: bool = val not in {"0", "false", "off", "no"}
+
+        # 初始化保留时间
         try:
             self._retention_sec = int(os.getenv("CHATGROUP_RETENTION_SEC", "604800"))  # 7 days
         except Exception:
@@ -110,6 +113,29 @@ class ChatGroupPlugin(Star):
         # Initialize embedding cache store (by text hash), with robust fallback
         store_root = _resolve_data_store_dir(_PLUGIN_DIR)
         self._text_embed_store = self._init_embedding_store(store_root)
+
+    def _resolve_platform_id(self, platform_id: str, event) -> str:
+        """当传入 platform_id 为 auto/*/self/当前 时，自动用当前消息事件的平台ID。"""
+        s = (platform_id or "").strip().lower()
+        if s in {"auto", "*", "self", "当前"}:
+            pid = None
+            # 1) 优先用 event.get_platform_id()
+            try:
+                if hasattr(event, "get_platform_id") and callable(event.get_platform_id):
+                    pid = event.get_platform_id()
+            except Exception:
+                pid = None
+            # 2) 兜底再试 event.platform_id（不同框架可能有）
+            if not pid:
+                try:
+                    pid = getattr(event, "platform_id", None)
+                except Exception:
+                    pid = None
+            # 3) 最后兜底到 napcat（你的当前运行环境日志就是 napcat）
+            return str(pid or "napcat")
+        return platform_id
+
+        # recording configs - 已移至 __init__ 方法中
 
     @staticmethod
     def _apply_config_env(cfg: dict) -> None:
@@ -165,7 +191,7 @@ class ChatGroupPlugin(Star):
         - 可通过环境变量 `CHATGROUP_RECORD=0` 关闭。
         - 可用 `CHATGROUP_RETENTION_SEC` 控制保留时长（默认 7 天）。
         """
-        if not self._record_enabled:
+        if not getattr(self, "_record_enabled", True):
             return
 
         # 获取平台/会话标识
@@ -446,6 +472,295 @@ class ChatGroupPlugin(Star):
             for t in topics:
                 lines.append(f"【{t['topic']}】条目 {t['size']} | 关键词 {', '.join(t['keywords'][:6])}")
             yield event.plain_result("\n".join(lines))
+
+    # ---------- 内部工具：共用的聚类入口（从 jsonl 路径运行一次聚类） ----------
+    async def _cluster_from_file(self, input_path: str):
+        if not os.path.exists(input_path):
+            return []
+
+        # 这些参数与 /讨论 指令保持一致，支持用环境变量覆盖
+        provider = os.getenv("PROVIDER", "siliconflow")
+        model = os.getenv("MODEL", "BAAI/bge-m3")
+        k_min = int(os.getenv("K_MIN", "2"))
+        k_max = int(os.getenv("K_MAX", "12"))
+        batch_size = int(os.getenv("BATCH_SIZE", "64"))
+        use_jieba = True
+
+        # 预读文本，补齐/预热嵌入，并预写缓存 .npy（与 list_topics 同步）
+        try:
+            texts: List[str] = []
+            with open(input_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        t = (rec.get("text") or "").strip()
+                        if t:
+                            texts.append(t)
+                    except Exception:
+                        continue
+            if not texts:
+                return []
+            vecs_map: Dict[str, np.ndarray] = {}
+            missing_items: List[Tuple[str, str]] = [(t, _sha256_text(t)) for t in texts]
+            if self._text_embed_store is not None:
+                vecs_map, missing_items = self._text_embed_store.bulk_get(texts)
+            if missing_items:
+                prov = self._pick_embedding_provider()
+                if prov is not None:
+                    miss_texts = [it[0] for it in missing_items]
+                    try:
+                        new_vecs = await prov.get_embeddings(miss_texts)
+                    except Exception:
+                        new_vecs = []
+                        for t in miss_texts:
+                            try:
+                                v = await prov.get_embedding(t)
+                                new_vecs.append(v)
+                            except Exception:
+                                new_vecs.append(None)
+                    for (t, sha), v in zip(missing_items, new_vecs):
+                        if v is None:
+                            continue
+                        arr = np.asarray(v, dtype=np.float32)
+                        self._text_embed_store.put(sha, arr)
+                        vecs_map[sha] = arr
+
+            # 预写 cache 供 src.cluster_once 使用
+            X_list: List[np.ndarray] = []
+            all_present = True
+            for t in texts:
+                sha = _sha256_text(t)
+                arr = vecs_map.get(sha)
+                if arr is None:
+                    all_present = False
+                    break
+                X_list.append(arr.astype(np.float32))
+            if all_present and X_list:
+                cache_path = _compute_cache_path(provider, model, texts)
+                Path(os.path.dirname(cache_path)).mkdir(parents=True, exist_ok=True)
+                np.save(cache_path, np.vstack(X_list))
+
+            # 调用真正的聚类实现
+            from src.main import cluster_once
+            clusters = cluster_once(
+                input_path=input_path,
+                provider=provider,
+                model=model,
+                k_min=k_min,
+                k_max=k_max,
+                batch_size=batch_size,
+                use_jieba=use_jieba,
+            )
+            return clusters
+        except Exception as e:
+            print(f"chatgroup: _cluster_from_file failed: {e}")
+            return []
+
+    # ---------- 内部工具：把 cluster 结构规范化为 API.md 约定的字段 ----------
+    def _normalize_clusters(self, clusters: List[dict]) -> List[dict]:
+        out: List[dict] = []
+        for idx, c in enumerate(clusters or []):
+            cid = int(c.get("cluster_id", idx))
+            reps = []
+            for m in (c.get("representative_messages") or []):
+                reps.append({
+                    "id": m.get("id"),
+                    "user": (m.get("user") or m.get("user_name") or "用户"),
+                    "timestamp": m.get("timestamp"),
+                    "text": m.get("text"),
+                })
+            out.append({
+                "cluster_id": cid,
+                "topic": c.get("topic") or f"主题#{cid}",
+                "size": int(c.get("size") or 0),
+                "keywords": c.get("keywords") or [],
+                "representative_messages": reps,
+                "message_ids": [str(x) for x in (c.get("message_ids") or [])],
+            })
+        return out
+
+    # ---------- 内部 API 1：列出讨论组 ----------
+    async def api_list_discussion_groups(self, platform_id: str, user_id: str, max_rows: int = 500) -> List[Dict]:
+        """
+        返回 List[Dict]，包含 cluster_id / topic / size / keywords / representative_messages / message_ids
+        """
+        input_path = await self._dump_recent_messages_jsonl(
+            platform_id=platform_id,
+            user_id=user_id,
+            max_rows=max_rows,
+            channel_hint=str(user_id),
+        )
+        if not input_path:
+            return []
+        clusters = await self._cluster_from_file(input_path)
+        return _ensure_json_serializable(self._normalize_clusters(clusters))  # type: ignore
+
+    # ---------- 内部 API 2：获取指定讨论组详情 ----------
+    async def api_get_discussion_group(self, platform_id: str, user_id: str, cluster_id: int, max_rows: int = 500) -> Dict | None:
+        """
+        在列表字段基础上，额外包含 messages: List[{id, user_id, user_name, timestamp, text, ...}]
+        """
+        input_path = await self._dump_recent_messages_jsonl(
+            platform_id=platform_id,
+            user_id=user_id,
+            max_rows=max_rows,
+            channel_hint=str(user_id),
+        )
+        if not input_path:
+            return None
+        clusters = await self._cluster_from_file(input_path)
+        norm = self._normalize_clusters(clusters)
+
+        # 找到目标 cluster
+        target = None
+        by_id = {int(c["cluster_id"]): c for c in norm}
+        if cluster_id in by_id:
+            target = by_id[cluster_id]
+        elif norm:
+            target = norm[0]  # 兜底
+
+        if not target:
+            return None
+
+        # 读取 jsonl，构造 id->record 映射，回表填充 messages
+        id_map: Dict[str, dict] = {}
+        try:
+            with open(input_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        rid = str(rec.get("id") or "")
+                        if rid:
+                            id_map[rid] = rec
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        msgs: List[dict] = []
+        mids = target.get("message_ids") or []
+        if mids and id_map:
+            for mid in mids:
+                r = id_map.get(str(mid))
+                if not r:
+                    continue
+                msgs.append({
+                    "id": r.get("id"),
+                    "user_id": r.get("user_id"),
+                    "user_name": r.get("user_name"),
+                    "timestamp": r.get("timestamp"),
+                    "text": r.get("text"),
+                    # 保留原始字段，方便前端需要时取用
+                    **{k: v for k, v in r.items() if k not in {"id", "user_id", "user_name", "timestamp", "text"}}
+                })
+
+        detail = dict(target)
+        detail["messages"] = msgs
+        return _ensure_json_serializable(detail)  # type: ignore
+
+    # ---------- 内部 API 3：按时间范围列出讨论组 ----------
+    async def api_list_discussion_groups_by_time(
+        self,
+        platform_id: str,
+        user_id: str,
+        start_time: str | int | datetime | None,
+        end_time: str | int | datetime | None,
+        max_rows: int = 1000,
+    ) -> List[Dict]:
+        """
+        start_time / end_time 支持 ISO 字符串或时间戳（秒）
+        """
+        base_path = await self._dump_recent_messages_jsonl(
+            platform_id=platform_id,
+            user_id=user_id,
+            max_rows=max_rows,
+            channel_hint=str(user_id),
+        )
+        if not base_path:
+            return []
+
+        def _to_ts(x) -> float | None:
+            if x is None:
+                return None
+            try:
+                if isinstance(x, (int, float)):
+                    return float(x)
+                if isinstance(x, str):
+                    # ISO -> ts
+                    try:
+                        dt = datetime.fromisoformat(x.replace("Z", "+00:00"))
+                        return dt.timestamp()
+                    except Exception:
+                        # 如果是纯数字字符串
+                        return float(x)
+                if isinstance(x, datetime):
+                    return x.timestamp()
+            except Exception:
+                return None
+            return None
+
+        ts_start = _to_ts(start_time)
+        ts_end = _to_ts(end_time)
+
+        # 过滤到临时文件
+        filt_path = os.path.join(tempfile.gettempdir(), f"chatgroup_range_{hashlib.md5((base_path+str(ts_start)+str(ts_end)).encode()).hexdigest()}.jsonl")
+        kept = 0
+        try:
+            with open(base_path, "r", encoding="utf-8") as fin, open(filt_path, "w", encoding="utf-8") as fout:
+                for line in fin:
+                    try:
+                        rec = json.loads(line)
+                        ts = rec.get("timestamp")
+                        # 把各种可能的时间格式转成 epoch
+                        if isinstance(ts, str):
+                            try:
+                                ts_val = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                            except Exception:
+                                ts_val = None
+                        elif isinstance(ts, (int, float)):
+                            ts_val = float(ts)
+                        else:
+                            ts_val = None
+
+                        ok = True
+                        if ts_start is not None and (ts_val is None or ts_val < ts_start):
+                            ok = False
+                        if ts_end is not None and (ts_val is None or ts_val > ts_end):
+                            ok = False
+                        if ok:
+                            fout.write(line)
+                            kept += 1
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"chatgroup: filter by time failed: {e}")
+            return []
+
+        if kept == 0:
+            return []
+
+        clusters = await self._cluster_from_file(filt_path)
+        return _ensure_json_serializable(self._normalize_clusters(clusters))  # type: ignore
+
+    # ---------- Web API 包装器（可选）：供 Dashboard /api/plug/chatgroup/* 转发 ----------
+    async def http_groups(self, platform_id: str, user_id: str, max_rows: int = 500):
+        data = await self.api_list_discussion_groups(platform_id, user_id, max_rows)
+        return {"status": "ok", "data": {"clusters": data}}
+
+    async def http_group_detail(self, platform_id: str, user_id: str, cluster_id: int, max_rows: int = 500):
+        detail = await self.api_get_discussion_group(platform_id, user_id, cluster_id, max_rows)
+        return {"status": "ok", "data": {"cluster": detail}}
+
+    async def http_groups_by_time(
+        self,
+        platform_id: str,
+        user_id: str,
+        start: str | int | datetime | None = None,
+        end: str | int | datetime | None = None,
+        max_rows: int = 1000,
+    ):
+        data = await self.api_list_discussion_groups_by_time(platform_id, user_id, start, end, max_rows)
+        return {"status": "ok", "data": {"clusters": data}}
 
     async def _dump_recent_messages_jsonl(
         self,
