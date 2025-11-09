@@ -108,6 +108,8 @@ def cluster_once(
         raise RuntimeError("Embedding 中存在 inf/nan，请检查输入或 provider 返回")
 
     WINDOW_MINUTES = getenv_int("WINDOW_MINUTES", 30)
+    # Only update clusters for recent messages within an active window
+    ACTIVE_WINDOW_MSGS = getenv_int("ACTIVE_WINDOW_MSGS", 100)
     H_MIN_CLUSTER = getenv_int("HDBSCAN_MIN_CLUSTER_SIZE", 20)
     H_MIN_SAMPLES = getenv_int("HDBSCAN_MIN_SAMPLES", 5)
     ATTACH_SIM_THR = getenv_float("ATTACH_SIM_THR", 0.35)
@@ -115,6 +117,13 @@ def cluster_once(
     MAX_RECLUSTER_SIZE = getenv_int("MAX_RECLUSTER_SIZE", 80)
 
     low_mask = np.array([is_low_content(t) for t in texts], dtype=bool)
+
+    # Compute active window range [active_start, n)
+    n_total = len(texts)
+    active_count = max(0, int(ACTIVE_WINDOW_MSGS))
+    active_start = max(0, n_total - active_count)
+    def _in_active(i: int) -> bool:
+        return i >= active_start
 
     CHITCHAT_SIM_THR = getenv_float("CHITCHAT_SIM_THR", 0.68)
     low_indices = [i for i in range(len(texts)) if low_mask[i]]
@@ -149,8 +158,9 @@ def cluster_once(
     core_mask = core_mask.flatten()
     border_mask = border_mask.flatten()
 
-    valid_idxs = [i for i in range(len(texts)) if core_mask[i]]
-    border_idxs = [i for i in range(len(texts)) if border_mask[i]]
+    # Limit clustering to active window only
+    valid_idxs = [i for i in range(len(texts)) if core_mask[i] and _in_active(i)]
+    border_idxs = [i for i in range(len(texts)) if border_mask[i] and _in_active(i)]
 
     global_labels = np.full(len(texts), -1, dtype=int)
     buckets = bucket_indices_by_time(msgs, valid_idxs, WINDOW_MINUTES)
@@ -189,7 +199,10 @@ def cluster_once(
                 global_labels[k] = remap[lab]
             next_cid += len(uniq)
 
+    # Mark chitchat only within active window (older messages remain untouched)
     for i in range(len(texts)):
+        if not _in_active(i):
+            continue
         if chit_mask[i] and not anchor_mask[i] and not low_mask[i]:
             global_labels[i] = -2
 
@@ -211,6 +224,7 @@ def cluster_once(
         and (global_labels[i] != -2)
         and (not low_mask[i])
         and (not (chit_mask[i] and not anchor_mask[i]))
+        and _in_active(i)
     ]
 
     KNN_K = getenv_int("KNN_K", 5)
@@ -228,11 +242,14 @@ def cluster_once(
         cluster_median_ts=cluster_median_ts,
     )
 
-    low_idxs = [i for i in range(len(texts)) if low_mask[i]]
+    low_idxs = [i for i in range(len(texts)) if low_mask[i] and _in_active(i)]
     global_labels = soft_attach_low_content(X, global_labels, low_idxs, msgs, attach_sim_thr=ATTACH_SIM_THR)
 
     ENABLE_CONTINUOUS_CHAIN = int(os.getenv("ENABLE_CONTINUOUS_CHAIN", "1"))
     MAX_TYPING_SPEED_CPS = getenv_float("MAX_TYPING_SPEED_CPS", 10.0)
+    # Preserve a snapshot before post-processing to avoid altering old messages
+    _pre_post_labels = global_labels.copy()
+
     labels = attach_continuous_by_typing_speed(
         global_labels,
         msgs,
@@ -243,6 +260,11 @@ def cluster_once(
 
     ENABLE_USER_SPAN_FILL = int(os.getenv("ENABLE_USER_SPAN_FILL", "1"))
     labels = fill_user_span_within_cluster(labels, msgs, enabled=bool(ENABLE_USER_SPAN_FILL))
+
+    # Roll back any label changes outside the active window
+    for _i in range(len(texts)):
+        if not _in_active(_i):
+            labels[_i] = _pre_post_labels[_i]
     reps = representative_indices(X, labels, topk=5)
 
     df = pd.DataFrame(
