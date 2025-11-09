@@ -88,7 +88,7 @@ def _migrate_legacy_store(plugin_dir: str, new_store_dir: str) -> None:
     "chatgroup",
     "codex",
     "讨论组工作流：上下文裁剪 + 语义向量存储 + 话题聚类",
-    "0.1.0",
+    "0.1.1",
     ""
 )
 class ChatGroupPlugin(Star):
@@ -134,6 +134,25 @@ class ChatGroupPlugin(Star):
             # 3) 最后兜底到 napcat（你的当前运行环境日志就是 napcat）
             return str(pid or "napcat")
         return platform_id
+
+    def _platform_alias_candidates(self, platform_id: str) -> list[str]:
+        """把传入的平台ID归一到一组候选值；支持 auto/*/self/当前。"""
+        s = (platform_id or "").strip().lower()
+        # 常见 OneBot 生态别名（按你当前运行环境优先 napcat）
+        known = ["napcat", "aiocqhttp", "lagrange"]
+        if s in {"auto", "*", "self", "当前"}:
+            return known  # auto：按顺序依次尝试
+        # 为了容错：napcat/aiocqhttp/lagrange 互为备选
+        mapping = {
+            "napcat":    ["napcat", "aiocqhttp", "lagrange"],
+            "aiocqhttp": ["aiocqhttp", "napcat", "lagrange"],
+            "lagrange":  ["lagrange", "aiocqhttp", "napcat"],
+        }
+        seen, out = set(), []
+        for pid in [s] + mapping.get(s, []):
+            if pid and pid not in seen:
+                seen.add(pid); out.append(pid)
+        return out or [s]
 
         # recording configs - 已移至 __init__ 方法中
 
@@ -778,16 +797,27 @@ class ChatGroupPlugin(Star):
         except Exception:
             return None
 
-        try:
-            rows = await mhm.get(
-                platform_id=platform_id,
-                user_id=user_id,
-                page=1,
-                page_size=max_rows,
-            )
-        except Exception:
-            return None
-
+        # 尝试多个平台别名，找到有数据的那个
+        best_rows = []
+        best_pid = None
+        for pid in self._platform_alias_candidates(platform_id):
+            cur = []
+            try:
+                cur = await mhm.get(
+                    platform_id=pid,
+                    user_id=user_id,
+                    page=1,
+                    page_size=max_rows,
+                )
+            except Exception:
+                cur = []
+            # 选"最有料"的候选（条数最多的）
+            if len(cur) > len(best_rows):
+                best_rows = cur
+                best_pid = pid
+        # 用命中的平台继续后续流程
+        rows = best_rows
+        platform_id = best_pid or platform_id
         if not rows:
             return None
 

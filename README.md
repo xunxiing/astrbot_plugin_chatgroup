@@ -1,6 +1,6 @@
 # AstrBot 讨论组插件 (chatgroup)
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue)
+![Version](https://img.shields.io/badge/version-0.1.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 > **免责声明**：作者本人真心不知道这个插件具体能做什么，但是感觉很有用就发布了。
@@ -73,11 +73,19 @@ xunxiing
 
 ~~优化性能开销，降低延迟到500ms以下（已实现）~~
 
-对外暴露api以供其他插件调用
+~~对外暴露api以供其他插件调用（已实现）~~
 
 加入簇合并机制
 
 优化性能开销，降低到400ms
+
+加入对于图片，文件，视频等资料的簇合并和抛弃
+
+完善现有的sqlite数据库存储，完善数据生命周期
+
+优化现有插件的性能，完善权重函数
+
+引入管理讨论组的api
 
 > 再次强调：作者本人真心不知道这个插件具体能做什么qwq，作为一个插件没有应该有的完善的机制，作为一个总结插件没有完善的高效总结机制，作为主动回复完全没有机制，但是我会长期维护这个插件，期待未来可以发现用处吧
 

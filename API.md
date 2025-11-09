@@ -6,6 +6,7 @@
 - Web API（通过 AstrBot Dashboard 插件路由 `/api/plug/*` 调用）
 
 说明：所有“会话”均由 `(platform_id, user_id)` 共同标识。
+
 - 群聊：`user_id` 使用群号（或平台群 ID）
 - 私聊：`user_id` 使用发送者 ID
 
@@ -20,20 +21,20 @@ if md and md.star_cls and md.activated:
     chatgroup = md.star_cls  # ChatGroupPlugin 实例
     # 1) 获取当前讨论组
     clusters = await chatgroup.api_list_discussion_groups(
-        platform_id="aiocqhttp",  # 示例平台 ID
+        platform_id="napcat",  # 示例平台 ID
         user_id="123456789",      # 群号或私聊用户 ID
         max_rows=500,              # 可选，默认 500，读取最近 N 条消息
     )
     # 2) 获取指定讨论组详情
     detail = await chatgroup.api_get_discussion_group(
-        platform_id="aiocqhttp",
+        platform_id="napcat",
         user_id="123456789",
         cluster_id=0,              # cluster_id 来自 clusters 返回值
         max_rows=500,
     )
     # 3) 按时间范围获取讨论组
     clusters2 = await chatgroup.api_list_discussion_groups_by_time(
-        platform_id="aiocqhttp",
+        platform_id="napcat",
         user_id="123456789",
         start_time="2025-01-01T00:00:00",  # ISO 字符串或时间戳秒数
         end_time=1735737600,                # 也可用时间戳（示例）
@@ -42,6 +43,7 @@ if md and md.star_cls and md.activated:
 ```
 
 ### 1) api_list_discussion_groups
+
 - 入参
   - `platform_id: str` 平台 ID（如 `aiocqhttp`、`slack` 等）
   - `user_id: str` 群号或用户 ID
@@ -55,6 +57,7 @@ if md and md.star_cls and md.activated:
   - `message_ids: List[str]` 该组包含的所有消息 ID（数据库记录 ID）
 
 ### 2) api_get_discussion_group
+
 - 入参
   - `platform_id: str`
   - `user_id: str`
@@ -65,6 +68,7 @@ if md and md.star_cls and md.activated:
     - `messages: List[ {id, user_id, user_name, timestamp, text, ...} ]` 组内所有消息详情（从同一批 jsonl 中回表构建）
 
 ### 3) api_list_discussion_groups_by_time
+
 - 入参
   - `platform_id: str`
   - `user_id: str`
@@ -76,9 +80,11 @@ if md and md.star_cls and md.activated:
 备注：内部 API 会尝试利用 AstrBot 的嵌入提供商预先写入缓存，以加速聚类。
 
 ## Web API（可选）
+
 所有路由挂载于插件路由前缀 `/api/plug` 下：
 
 - 列出讨论组：
+  
   - `GET /api/plug/chatgroup/groups?platform_id=...&user_id=...&max_rows=500`
   - 返回：
     ```json
@@ -87,8 +93,8 @@ if md and md.star_cls and md.activated:
       "data": { "clusters": [ /* 同内部 API 列表结构 */ ] }
     }
     ```
-
 - 讨论组详情：
+  
   - `GET /api/plug/chatgroup/group_detail?platform_id=...&user_id=...&cluster_id=...&max_rows=500`
   - 返回：
     ```json
@@ -97,18 +103,20 @@ if md and md.star_cls and md.activated:
       "data": { "cluster": { /* 同内部 API 详情结构 */ } }
     }
     ```
-
 - 按时间范围列出讨论组：
+  
   - `GET /api/plug/chatgroup/groups_by_time?platform_id=...&user_id=...&start=...&end=...&max_rows=1000`
   - `start`/`end` 支持 ISO 字符串或时间戳秒数
   - 返回：同“列出讨论组”
 
 ## 行为与限制
+
 - 讨论组（主题）是基于“最近消息 + 活跃窗口”的无状态计算结果，并非永久存储。
 - `max_rows` 控制读取的最近消息上限，建议 200~1000 之间。
 - 首次计算如出现嵌入缺失，会尝试调用当前 AstrBot 配置的嵌入提供商进行补齐并缓存。
 - 若未配置嵌入提供商，则仍可工作，但可能需要插件 `src/` 的 provider 路径可用或预先有缓存。
 
 ## 版本
-- 插件版本：`0.1.0+api`（文档声明，不影响 `metadata.yaml`）
+
+- 插件版本：`0.1.1+api`（文档声明，不影响 `metadata.yaml`）
 
