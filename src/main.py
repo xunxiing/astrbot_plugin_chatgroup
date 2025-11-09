@@ -30,6 +30,7 @@ from src.data_processing import (
     has_anchor,
 )
 from src.embeddings import Embedder, LocalSTEmbedder, SiliconFlowEmbedder
+import sqlite3
 from src.clustering import (
     auto_kmeans,
     hdbscan_cluster,
@@ -92,17 +93,106 @@ def cluster_once(
     key = _cache_key(provider, model, texts)
     cache_path = os.path.join("data", f"embeddings_{_slug(provider)}_{_slug(model)}_{key[:16]}.npy")
 
+    def _sha256_text(t: str) -> str:
+        h = hashlib.sha256()
+        h.update(t.encode("utf-8"))
+        return h.hexdigest()
+
+    def _resolve_store_dir() -> str | None:
+        # 1) Explicit override
+        od = os.getenv("CHATGROUP_STORE_DIR")
+        if od:
+            return os.path.abspath(od)
+        # 2) AstrBot data dir
+        dd = os.getenv("ASTRBOT_DATA_DIR")
+        if dd:
+            return os.path.join(os.path.abspath(dd), "chatgroup")
+        # 3) Two-level up from this src directory (…/AstrBot/data)
+        try:
+            src_dir = os.path.dirname(os.path.abspath(__file__))
+            plugin_root = os.path.abspath(os.path.join(src_dir, os.pardir))
+            data_root = os.path.abspath(os.path.join(plugin_root, os.pardir, os.pardir))
+            return os.path.join(data_root, "chatgroup")
+        except Exception:
+            return None
+
+    def _load_from_sqlite_if_available(texts: list[str]) -> np.ndarray | None:
+        store_dir = _resolve_store_dir()
+        if not store_dir:
+            return None
+        db_path = os.path.join(store_dir, "vec_cache", "text_embeds.sqlite")
+        if not os.path.exists(db_path):
+            return None
+        try:
+            conn = sqlite3.connect(db_path, timeout=15)
+        except Exception:
+            return None
+        try:
+            shas = [_sha256_text(t) for t in texts]
+            # batch fetch
+            q = ",".join(["?"] * len(shas))
+            cur = conn.execute(f"SELECT sha, vec, dim FROM text_embeddings WHERE sha IN ({q})", tuple(shas))
+            buf_map: dict[str, tuple[bytes, int]] = {sha: (vec, int(dim)) for sha, vec, dim in cur.fetchall()}
+            rows: list[np.ndarray] = []
+            found_any = False
+            for sha in shas:
+                item = buf_map.get(sha)
+                if not item:
+                    rows.append(None)  # type: ignore
+                    continue
+                vec_bytes, dim = item
+                try:
+                    arr = np.frombuffer(vec_bytes, dtype=np.float32)
+                    if arr.size != dim:
+                        rows.append(None)  # type: ignore
+                    else:
+                        rows.append(arr.astype(np.float32))
+                        found_any = True
+                except Exception:
+                    rows.append(None)  # type: ignore
+            if not found_any:
+                return None
+            # Fill missing rows with mean of found (or zeros if only one)
+            present = [r for r in rows if isinstance(r, np.ndarray)]
+            dim = present[0].shape[0]
+            if len(present) >= 2:
+                mean_vec = np.mean(np.stack(present, axis=0), axis=0).astype(np.float32)
+            else:
+                mean_vec = present[0].astype(np.float32)
+            filled = [r if isinstance(r, np.ndarray) else mean_vec for r in rows]
+            X_ = np.vstack([r.reshape(1, -1) for r in filled]).astype(np.float32)
+            # Persist cache for future runs
+            try:
+                np.save(cache_path, X_)
+            except Exception:
+                pass
+            return X_
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    X: np.ndarray | None = None
     if os.path.exists(cache_path):
         try:
             X = np.load(cache_path)
             if X.shape[0] != len(texts):
                 raise ValueError("cache-size-mismatch")
         except Exception:
-            X = embedder.embed(texts, batch_size=batch_size)
-            np.save(cache_path, X)
-    else:
+            X = None
+    if X is None:
+        # Try to build from sqlite cache first
+        X = _load_from_sqlite_if_available(texts)
+    if X is None:
+        # Last resort: call provider only when it is actually usable
+        if provider.lower() == "siliconflow" and not os.getenv("SILICONFLOW_API_KEY"):
+            raise RuntimeError("向量缺失且未配置嵌入服务，请先配置或等待缓存补全")
         X = embedder.embed(texts, batch_size=batch_size)
-        np.save(cache_path, X)
+        try:
+            np.save(cache_path, X)
+        except Exception:
+            pass
 
     if not np.all(np.isfinite(X)):
         raise RuntimeError("Embedding 中存在 inf/nan，请检查输入或 provider 返回")

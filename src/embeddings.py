@@ -69,7 +69,8 @@ class SiliconFlowEmbedder(Embedder):
 
     def embed(self, texts: List[str], batch_size: int = 64) -> np.ndarray:
         if not self.api_key:
-            raise RuntimeError("SILICONFLOW_API_KEY not set in environment")
+            # Keep message neutral and provider-focused, not env-string specific
+            raise RuntimeError("SiliconFlow API Key 未配置")
         out: List[List[float]] = []
         headers = {
             "Authorization": f"Bearer {self.api_key}",
